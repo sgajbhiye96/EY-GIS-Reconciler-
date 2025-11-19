@@ -162,99 +162,118 @@ def collapse_duplicates(df, conf_df):
 # ---------------------------
 # Reconciliation with separate fuzzy columns & parent comparison
 # ---------------------------
+from rapidfuzz import fuzz
+
 def build_reconciliation(df_client, df_gis):
-    # Defensive copies
-    df_client_cmp = df_client.copy()
-    df_gis_cmp = df_gis.copy()
 
-    # lower-case helpers for comparison
-    df_client_cmp["entity_l"] = df_client_cmp["entity"].astype(str).str.lower()
-    df_client_cmp["parent_l"] = df_client_cmp["parent"].astype(str).str.lower()
+    # Normalize lowercase helpers
+    df_client["entity_l"] = df_client["entity"].str.lower().str.strip()
+    df_client["parent_l"] = df_client["parent"].str.lower().str.strip()
 
-    df_gis_cmp["entity_l"] = df_gis_cmp["entity"].astype(str).str.lower()
-    df_gis_cmp["parent_l"] = df_gis_cmp["parent"].astype(str).str.lower()
+    df_gis["entity_l"] = df_gis["entity"].str.lower().str.strip()
+    df_gis["parent_l"] = df_gis["parent"].str.lower().str.strip()
 
-    entities = sorted(
-        set(df_client_cmp["entity_l"]).union(set(df_gis_cmp["entity_l"]))
-    )
+    # FULL SET OF ALL ENTITIES
+    all_entities = sorted(set(df_client["entity_l"]).union(df_gis["entity_l"]))
 
     rows = []
-    for ent in entities:
-        client_row = df_client_cmp[df_client_cmp["entity_l"] == ent]
-        gis_row = df_gis_cmp[df_gis_cmp["entity_l"] == ent]
 
-        entity_disp = (
-            client_row.iloc[0]["entity"] if not client_row.empty else gis_row.iloc[0]["entity"]
-        )
+    for ent in all_entities:
 
-        org_parent = client_row.iloc[0]["parent"] if not client_row.empty else ""
-        gis_parent = gis_row.iloc[0]["parent"] if not gis_row.empty else ""
+        # Lookup rows
+        c_row = df_client[df_client["entity_l"] == ent]
+        g_row = df_gis[df_gis["entity_l"] == ent]
 
-        # -----------------------------
-        # 1. Exact match comparison
-        # -----------------------------
-        if client_row.empty:
+        # Display name preference
+        def pick_name(c, g):
+            c_val = c.iloc[0]["entity"] if not c.empty else ""
+            g_val = g.iloc[0]["entity"] if not g.empty else ""
+            if g_val and not g_val.isdigit():
+                return g_val
+            if c_val and not c_val.isdigit():
+                return c_val
+            return g_val or c_val
+
+        display_entity = pick_name(c_row, g_row)
+
+        # Parent names
+        client_parent = c_row.iloc[0]["parent"] if not c_row.empty else ""
+        gis_parent = g_row.iloc[0]["parent"] if not g_row.empty else ""
+
+        # Lower versions
+        client_parent_l = c_row.iloc[0]["parent_l"] if not c_row.empty else ""
+        gis_parent_l = g_row.iloc[0]["parent_l"] if not g_row.empty else ""
+
+        # --------------------------------
+        # 1️⃣ Exact match logic
+        # --------------------------------
+        if c_row.empty:
             exact_status = "MISSING IN CLIENT"
-        elif gis_row.empty:
+        elif g_row.empty:
             exact_status = "MISSING IN GIS"
         else:
-            if client_row.iloc[0]["parent_l"] == gis_row.iloc[0]["parent_l"]:
+            if client_parent_l == gis_parent_l:
                 exact_status = "EXACT MATCH"
             else:
                 exact_status = "PARENT MISMATCH"
 
-        # -----------------------------
-        # 2. Fuzzy Matching (best candidate in GIS for entity)
-        # -----------------------------
-        fuzzy_best = None
-        fuzzy_best_parent = ""
-        fuzzy_score = 0
+        # --------------------------------
+        # 2️⃣ Fuzzy matching of ENTITIES
+        # --------------------------------
+        best_fuzzy_name = ""
+        best_fuzzy_parent = ""
+        best_score = -1
 
-        for _, g in df_gis_cmp.iterrows():
-            # ensure strings
-            g_ent = str(g["entity"])
-            score = fuzz.token_sort_ratio(entity_disp.lower(), g_ent.lower())
-            if score > fuzzy_score:
-                fuzzy_score = score
-                fuzzy_best = g_ent
-                fuzzy_best_parent = g.get("parent", "")
+        for _, g in df_gis.iterrows():
+            score = fuzz.token_sort_ratio(display_entity.lower(), g["entity"].lower())
+            if score > best_score:
+                best_score = score
+                best_fuzzy_name = g["entity"]
+                best_fuzzy_parent = g["parent"]
 
-        # -----------------------------
-        # 3. Final parent comparison logic
-        # -----------------------------
+        # --------------------------------
+        # 3️⃣ Final parent relationship logic
+        # --------------------------------
+
         if exact_status == "EXACT MATCH":
-            final_parent_compare = "Exact Parent Match"
-        elif exact_status == "PARENT MISMATCH":
-            final_parent_compare = "Exact Parent Mismatch"
-        elif fuzzy_score >= 85:
-            # compare org_parent vs fuzzy_best_parent
-            if str(org_parent).strip().lower() == str(fuzzy_best_parent).strip().lower():
-                final_parent_compare = "Fuzzy Parent Match"
-            else:
-                final_parent_compare = "Fuzzy Parent Mismatch"
-        else:
-            final_parent_compare = "No Suitable Match"
+            final_status = "Exact Parent Match"
 
-        # Row: keep consistent column names
+        elif exact_status == "PARENT MISMATCH":
+            final_status = "Exact Parent Mismatch"
+
+        elif best_score >= 85:   # fuzzy ok
+            if client_parent_l == str(best_fuzzy_parent).lower().strip():
+                final_status = "Fuzzy Parent Match"
+            else:
+                final_status = "Fuzzy Parent Mismatch"
+        else:
+            final_status = "No Suitable Match"
+
+        # --------------------------------
+        # Append result
+        # --------------------------------
         rows.append({
-            "Entity": entity_disp,
-            "Org Chart Parent": org_parent,
+            "Entity": display_entity,
+            "Org Chart Parent": client_parent,
             "GIS Parent (Exact)": gis_parent,
             "Exact Status": exact_status,
-            "Fuzzy Best Match (GIS)": fuzzy_best,
-            "Fuzzy Best Match Parent (GIS)": fuzzy_best_parent,
-            "Fuzzy Score": fuzzy_score,
-            "Final Parent Comparison": final_parent_compare
+            "Fuzzy Best Match (GIS)": best_fuzzy_name,
+            "Fuzzy Best Match Parent (GIS)": best_fuzzy_parent,
+            "Fuzzy Score": best_score,
+            "Final Parent Comparison": final_status
         })
 
+    # Create tables
     recon = pd.DataFrame(rows)
-
-    # Split outputs as needed (use Exact Status)
-    only_client = recon[recon["Exact Status"] == "MISSING IN GIS"].reset_index(drop=True)
-    only_gis    = recon[recon["Exact Status"] == "MISSING IN CLIENT"].reset_index(drop=True)
-    mismatch    = recon[recon["Final Parent Comparison"].isin(["Exact Parent Mismatch", "Fuzzy Parent Mismatch"])].reset_index(drop=True)
+    only_client = recon[recon["Exact Status"] == "MISSING IN GIS"]
+    only_gis = recon[recon["Exact Status"] == "MISSING IN CLIENT"]
+    mismatch = recon[
+        recon["Final Parent Comparison"].isin(["Exact Parent Mismatch", "Fuzzy Parent Mismatch"])
+    ]
 
     return recon, only_client, only_gis, mismatch
+
+
 
 # ---------------------------
 # Excel Workbook Builder (robust)
@@ -440,4 +459,5 @@ with open(excel, "rb") as f:
     st.download_button("Download GIS_Reconciliation.xlsx", f, "GIS_Reconciliation.xlsx")
 
 st.success("Done.")
+
 
