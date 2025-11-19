@@ -1,0 +1,8 @@
+streamlit==1.40.1
+pandas==2.0.3
+openpyxl==3.1.5
+rapidfuzz==3.9.7
+openai
+azure-identity==1.17.1
+Pillow==10.4.0
+pymupdf==1.24.10
