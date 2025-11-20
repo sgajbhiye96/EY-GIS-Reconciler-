@@ -294,10 +294,10 @@ def build_reconciliation(df_client, df_gis, fuzzy_threshold=80):
 
         # action rules exactly as specified
         if in_client and not in_gis:
-            action = "To be removed from GIS tree."
+            action = "To be added in GIS."
             color = "red"
         elif in_gis and not in_client:
-            action = "To be added in GIS tree."
+            action = "To be removed from GIS."
             color = "yellow"
         elif in_gis and in_client:
             # both present: compare parents case-insensitive (keep parentheses in values)
@@ -308,7 +308,7 @@ def build_reconciliation(df_client, df_gis, fuzzy_threshold=80):
                 action = "Mismatch noted, please further check."
                 color = "red"
         else:
-            action = "To be added in GIS tree."
+            action = "Matched."
             color = "yellow"
 
         rows.append({
@@ -414,7 +414,7 @@ except Exception as e:
 df_gis = normalize_gis_dataframe(raw_gis)
 
 # Extract client entities:
-st.subheader("Extracting from org chart (Azure Vision) — keeping parentheses")
+st.subheader("Extracting from org chart (Azure Vision)")
 
 pages = []
 raw_outputs = []
