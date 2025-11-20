@@ -1,463 +1,380 @@
 
+
 import streamlit as st
-st.set_page_config(page_title="EY GIS Reconciler", layout="wide")
+st.set_page_config(page_title="EY GIS Reconciler — Entity/Parent Focus", layout="wide")
 
 import pandas as pd
+import json
 import base64
 import tempfile
-import json
-import fitz  # PyMuPDF
-from openai import AzureOpenAI
+from rapidfuzz import fuzz
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Border, Side
-from rapidfuzz import fuzz
 
-# ---------------------------
-# Azure configuration
-# ---------------------------
-AZURE_ENDPOINT = "https://azureopenaids2025.openai.azure.com"
-DEPLOYMENT_NAME = "gpt4o"
-API_VERSION = "2025-03-01-preview"
-API_KEY = st.secrets["AZURE_OPENAI_KEY"]
+# Optional Azure client (only used if secrets present)
+try:
+    from openai import AzureOpenAI
+except Exception:
+    AzureOpenAI = None
 
-client = AzureOpenAI(
-    api_key=API_KEY,
-    api_version=API_VERSION,
-    azure_endpoint=AZURE_ENDPOINT
-)
+# -----------------------
+# Sidebar / Controls
+# -----------------------
+st.sidebar.header("Controls")
+FUZZY_DEFAULT = 80
+FUZZY_THRESHOLD = st.sidebar.slider("Fuzzy threshold", 60, 100, FUZZY_DEFAULT, 1)
+st.sidebar.markdown("**GIS columns used:** `Entity Name` and `Parent Name` (confirmed).")
 
-# ---------------------------
-# PDF to Images
-# ---------------------------
-def pdf_to_images(uploaded_file):
-    images = []
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(uploaded_file.read())
-        tmp_path = tmp.name
-    pdf = fitz.open(tmp_path)
-    for page in pdf:
-        pix = page.get_pixmap(dpi=200)
-        images.append(pix.tobytes("png"))
-    return images
+# Azure/OpenAI secrets (optional)
+AZURE_ENDPOINT = st.secrets.get("AZURE_OPENAI_ENDPOINT", None)
+AZURE_KEY = st.secrets.get("AZURE_OPENAI_KEY", None)
+AZURE_DEPLOY = st.secrets.get("AZURE_OPENAI_DEPLOYMENT", "gpt4o")
+AZURE_API_VER = st.secrets.get("AZURE_OPENAI_API_VERSION", "2025-03-01-preview")
 
-# ---------------------------
-# GPT-4o Vision Extraction
-# ---------------------------
-def call_gpt4o_extract(image_bytes, max_output_tokens=1400):
-    try:
-        img_b64 = base64.b64encode(image_bytes).decode()
+client = None
+if AZURE_KEY and AzureOpenAI is not None and AZURE_ENDPOINT:
+    client = AzureOpenAI(api_key=AZURE_KEY, api_version=AZURE_API_VER, azure_endpoint=AZURE_ENDPOINT)
 
-        response = client.responses.create(
-            model=DEPLOYMENT_NAME,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "Extract ALL entities and parent-child relationships "
-                                "from this organisation chart. "
-                                "Return STRICT JSON = [{\"entity\":\"\",\"parent\":\"\"}, ...]. "
-                                "Top-level → parent=null. No hallucinations."
-                            )
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/png;base64,{img_b64}"
-                        }
-                    ]
-                }
-            ],
-            max_output_tokens=max_output_tokens
-        )
-
-        extracted = []
-        if not response.output:
-            return None
-
-        for msg in response.output:
-            for c in msg.content:
-                if hasattr(c, "text") and c.text:
-                    extracted.append(c.text)
-
-        return "\n".join(extracted)
-
-    except Exception as e:
-        st.error(f"GPT Vision error: {e}")
-        return None
-
-# ---------------------------
-# Robust JSON Parsing
-# ---------------------------
-def parse_model_json(raw_text):
-    if not raw_text:
-        return None
-    cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
-
-    # JSON attempt
-    try:
-        return pd.DataFrame(json.loads(cleaned))
-    except:
-        pass
-
-    # Python fallback
-    try:
-        py = cleaned.replace(": null", ": None")
-        return pd.DataFrame(eval(py))
-    except Exception as e:
-        st.error(f"JSON parse failed: {e}")
-        st.code(raw_text[:3000])
-        return None
-
-# ---------------------------
-# Normalization FIX (IMPORTANT)
-# ---------------------------
-def normalize_entity_parent(df):
+# -----------------------
+# Helper functions
+# -----------------------
+def normalize_entity_parent_from_generic(df):
+    """
+    Normalize a DataFrame to exactly columns ['entity','parent'] (strings)
+    If GIS file has 'Entity Name' and 'Parent Name', map them.
+    If it's generic (json/csv from extraction), attempt to find columns.
+    """
     df = df.copy()
-    # Normalize column names to lower
-    df.columns = [c.lower().strip() for c in df.columns]
+    # standardize column names for detection
+    cols_l = [str(c).strip() for c in df.columns]
+    lower = [c.lower() for c in cols_l]
 
-    # Ensure entity exists
-    if "entity" not in df.columns:
-        df = df.rename(columns={df.columns[0]: "entity"})
+    # Try GIS explicit mapping first
+    if "entity name" in [c.lower() for c in cols_l] and "parent name" in [c.lower() for c in cols_l]:
+        # preserve original case column names by finding indices
+        ent_col = cols_l[[c.lower() for c in cols_l].index("entity name")]
+        parent_col = cols_l[[c.lower() for c in cols_l].index("parent name")]
+        df2 = pd.DataFrame({
+            "entity": df[ent_col].astype(str).str.strip(),
+            "parent": df[parent_col].astype(str).str.strip()
+        })
+        return df2
 
-    # Ensure parent exists
-    if "parent" not in df.columns:
-        if len(df.columns) > 1:
-            df = df.rename(columns={df.columns[1]: "parent"})
-        else:
-            df["parent"] = ""
-
-    df["entity"] = df["entity"].astype(str).str.strip()
-    df["parent"] = (
-        df["parent"]
-        .astype(str)
-        .str.strip()
-        .replace(["None", "none", "nan", "NaN", "NULL", "null"], "")
-    )
-    return df[["entity", "parent"]]
-
-# ---------------------------
-# Collapse duplicate entities using fuzzy + GPT-confidence
-# ---------------------------
-def collapse_duplicates(df, conf_df):
-    df = df.copy()
-
-    groups = {}
-    for _, r in conf_df.iterrows():
-        rep = r["representative"]
-        for m in r["merged_items"]:
-            groups.setdefault(rep, []).append(m)
-
-    dedup_rows = []
-    for rep, members in groups.items():
-        parents = df[df["entity"].isin(members)]["parent"].unique().tolist()
-        parent = parents[0] if parents else ""
-        dedup_rows.append({"entity": rep, "parent": parent})
-
-    dedup = pd.DataFrame(dedup_rows)
-    return dedup[["entity", "parent"]]
-
-# ---------------------------
-# Reconciliation with separate fuzzy columns & parent comparison
-# ---------------------------
-from rapidfuzz import fuzz
-
-def build_reconciliation(df_client, df_gis):
-
-    # Normalize lowercase helpers
-    df_client["entity_l"] = df_client["entity"].str.lower().str.strip()
-    df_client["parent_l"] = df_client["parent"].str.lower().str.strip()
-
-    df_gis["entity_l"] = df_gis["entity"].str.lower().str.strip()
-    df_gis["parent_l"] = df_gis["parent"].str.lower().str.strip()
-
-    # FULL SET OF ALL ENTITIES
-    all_entities = sorted(set(df_client["entity_l"]).union(df_gis["entity_l"]))
-
-    rows = []
-
-    for ent in all_entities:
-
-        # Lookup rows
-        c_row = df_client[df_client["entity_l"] == ent]
-        g_row = df_gis[df_gis["entity_l"] == ent]
-
-        # Display name preference
-        def pick_name(c, g):
-            c_val = c.iloc[0]["entity"] if not c.empty else ""
-            g_val = g.iloc[0]["entity"] if not g.empty else ""
-            if g_val and not g_val.isdigit():
-                return g_val
-            if c_val and not c_val.isdigit():
-                return c_val
-            return g_val or c_val
-
-        display_entity = pick_name(c_row, g_row)
-
-        # Parent names
-        client_parent = c_row.iloc[0]["parent"] if not c_row.empty else ""
-        gis_parent = g_row.iloc[0]["parent"] if not g_row.empty else ""
-
-        # Lower versions
-        client_parent_l = c_row.iloc[0]["parent_l"] if not c_row.empty else ""
-        gis_parent_l = g_row.iloc[0]["parent_l"] if not g_row.empty else ""
-
-        # --------------------------------
-        # 1️⃣ Exact match logic
-        # --------------------------------
-        if c_row.empty:
-            exact_status = "MISSING IN CLIENT"
-        elif g_row.empty:
-            exact_status = "MISSING IN GIS"
-        else:
-            if client_parent_l == gis_parent_l:
-                exact_status = "EXACT MATCH"
-            else:
-                exact_status = "PARENT MISMATCH"
-
-        # --------------------------------
-        # 2️⃣ Fuzzy matching of ENTITIES
-        # --------------------------------
-        best_fuzzy_name = ""
-        best_fuzzy_parent = ""
-        best_score = -1
-
-        for _, g in df_gis.iterrows():
-            score = fuzz.token_sort_ratio(display_entity.lower(), g["entity"].lower())
-            if score > best_score:
-                best_score = score
-                best_fuzzy_name = g["entity"]
-                best_fuzzy_parent = g["parent"]
-
-        # --------------------------------
-        # 3️⃣ Final parent relationship logic
-        # --------------------------------
-
-        if exact_status == "EXACT MATCH":
-            final_status = "Exact Parent Match"
-
-        elif exact_status == "PARENT MISMATCH":
-            final_status = "Exact Parent Mismatch"
-
-        elif best_score >= 85:   # fuzzy ok
-            if client_parent_l == str(best_fuzzy_parent).lower().strip():
-                final_status = "Fuzzy Parent Match"
-            else:
-                final_status = "Fuzzy Parent Mismatch"
-        else:
-            final_status = "No Suitable Match"
-
-        # --------------------------------
-        # Append result
-        # --------------------------------
-        rows.append({
-            "Entity": display_entity,
-            "Org Chart Parent": client_parent,
-            "GIS Parent (Exact)": gis_parent,
-            "Exact Status": exact_status,
-            "Fuzzy Best Match (GIS)": best_fuzzy_name,
-            "Fuzzy Best Match Parent (GIS)": best_fuzzy_parent,
-            "Fuzzy Score": best_score,
-            "Final Parent Comparison": final_status
+    # Otherwise fallback heuristics
+    # If 'entity' and 'parent' present
+    if "entity" in lower and "parent" in lower:
+        ent_col = cols_l[lower.index("entity")]
+        parent_col = cols_l[lower.index("parent")]
+        return pd.DataFrame({
+            "entity": df[ent_col].astype(str).str.strip(),
+            "parent": df[parent_col].astype(str).str.strip()
         })
 
-    # Create tables
+    # Try first two columns
+    if len(cols_l) >= 2:
+        ent_col = cols_l[0]
+        parent_col = cols_l[1]
+        return pd.DataFrame({
+            "entity": df[ent_col].astype(str).str.strip(),
+            "parent": df[parent_col].astype(str).str.strip()
+        })
+
+    # If only one column, parent empty
+    ent_col = cols_l[0] if cols_l else "entity"
+    df2 = pd.DataFrame({
+        "entity": df[ent_col].astype(str).str.strip(),
+        "parent": ["" for _ in range(len(df))]
+    })
+    return df2
+
+def compute_reconciliation(df_client, df_gis, fuzzy_threshold=80):
+    """
+    Compute reconciliation rows.
+    Returns DataFrame with:
+    ['Entity Name in GIS','Entity Name in Org Chart','Parent Name in GIS','Parent Name in Org Chart',
+     'Fuzzy Best Match (GIS)','Fuzzy Best Match Parent (GIS)','Fuzzy Score','Action point','_color']
+    """
+    df_c = df_client.copy()
+    df_g = df_gis.copy()
+
+    # lowercase helper columns for comparison
+    df_c["entity_l"] = df_c["entity"].str.lower().str.strip()
+    df_c["parent_l"] = df_c["parent"].str.lower().str.strip()
+    df_g["entity_l"] = df_g["entity"].str.lower().str.strip()
+    df_g["parent_l"] = df_g["parent"].str.lower().str.strip()
+
+    # union of names
+    all_entities = sorted(set(df_c["entity_l"]).union(set(df_g["entity_l"])))
+
+    rows = []
+    for ent in all_entities:
+        c_rows = df_c[df_c["entity_l"] == ent]
+        g_rows = df_g[df_g["entity_l"] == ent]
+
+        client_name = c_rows.iloc[0]["entity"] if not c_rows.empty else ""
+        gis_name = g_rows.iloc[0]["entity"] if not g_rows.empty else ""
+
+        client_parent = c_rows.iloc[0]["parent"] if not c_rows.empty else ""
+        gis_parent = g_rows.iloc[0]["parent"] if not g_rows.empty else ""
+
+        # Base string to fuzzy-match: prefer visible client name, otherwise GIS, otherwise raw ent key
+        base_to_match = (client_name or gis_name or ent).strip()
+
+        # Find best fuzzy candidate from GIS (search only GIS entity names)
+        best_name = ""
+        best_parent = ""
+        best_score = 0
+        for _, g in df_g.iterrows():
+            score = fuzz.token_sort_ratio(base_to_match.lower(), str(g["entity"]).lower())
+            if score > best_score:
+                best_score = score
+                best_name = g["entity"]
+                best_parent = g["parent"]
+
+        # Determine presence of text names (we treat empty strings as missing)
+        in_client = bool(client_name and client_name.strip())
+        in_gis = bool(gis_name and gis_name.strip())
+
+        # ACTION RULES (as requested)
+        # If entity exists in Client and missing in GIS -> "To be removed from GIS tree."
+        # If entity exists in GIS and missing in Client -> "To be added in GIS tree."
+        # If exists in both but parent mismatch -> "Mismatch noted, please further check."
+        if in_client and not in_gis:
+            action = "To be removed from GIS tree."
+            color = "red"
+        elif in_gis and not in_client:
+            action = "To be added in GIS tree."
+            color = "yellow"
+        elif in_gis and in_client:
+            # compare parents case-insensitive
+            if client_parent.strip().lower() == gis_parent.strip().lower():
+                action = "Matched"
+                color = "white"
+            else:
+                action = "Mismatch noted, please further check."
+                color = "red"
+        else:
+            # both missing - shouldn't happen normally; treat as add if client has non-empty base
+            if base_to_match.strip():
+                action = "To be added in GIS tree."
+                color = "yellow"
+            else:
+                action = "Matched"
+                color = "white"
+
+        rows.append({
+            "Entity Name in GIS": gis_name,
+            "Entity Name in Org Chart": client_name,
+            "Parent Name in GIS": gis_parent,
+            "Parent Name in Org Chart": client_parent,
+            "Fuzzy Best Match (GIS)": best_name,
+            "Fuzzy Best Match Parent (GIS)": best_parent,
+            "Fuzzy Score": int(best_score),
+            "Action point": action,
+            "_color": color
+        })
+
     recon = pd.DataFrame(rows)
-    only_client = recon[recon["Exact Status"] == "MISSING IN GIS"]
-    only_gis = recon[recon["Exact Status"] == "MISSING IN CLIENT"]
-    mismatch = recon[
-        recon["Final Parent Comparison"].isin(["Exact Parent Mismatch", "Fuzzy Parent Mismatch"])
+    return recon
+
+def export_styled_excel(recon_df):
+    """Export a styled Excel with the exact columns and coloring."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Reconciliation"
+
+    headers = [
+        "Entity Name in GIS","Entity Name in Org Chart","Parent Name in GIS","Parent Name in Org Chart",
+        "Fuzzy Best Match (GIS)","Fuzzy Best Match Parent (GIS)","Fuzzy Score","Action point"
     ]
+    ws.append(headers)
 
-    return recon, only_client, only_gis, mismatch
+    yellow = "FFF2CC"
+    red = "F8CBCC"
+    white = "FFFFFF"
+    border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
 
+    for _, r in recon_df.iterrows():
+        ws.append([
+            r["Entity Name in GIS"],
+            r["Entity Name in Org Chart"],
+            r["Parent Name in GIS"],
+            r["Parent Name in Org Chart"],
+            r["Fuzzy Best Match (GIS)"],
+            r["Fuzzy Best Match Parent (GIS)"],
+            r["Fuzzy Score"],
+            r["Action point"]
+        ])
 
-
-# ---------------------------
-# Excel Workbook Builder (robust)
-# ---------------------------
-def apply_style(ws):
-    yellow = "FFD700"
-    gray = "E0E0E0"
-    border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                    top=Side(style='thin'), bottom=Side(style='thin'))
-
-    # style header row (first row)
+    # header style
     for cell in ws[1]:
-        cell.fill = PatternFill(start_color=yellow, fill_type="solid")
+        cell.fill = PatternFill(start_color="FFD700", fill_type="solid")
         cell.font = Font(bold=True)
         cell.border = border
 
-    # style other rows
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.fill = PatternFill(start_color=gray, fill_type="solid")
+    # rows style
+    for i, _ in enumerate(recon_df.itertuples(index=False), start=2):
+        color = recon_df.iloc[i-2].get("_color", "white")
+        fill_color = white
+        if color == "yellow":
+            fill_color = yellow
+        elif color == "red":
+            fill_color = red
+        for cell in ws[i]:
+            cell.fill = PatternFill(start_color=fill_color, fill_type="solid")
             cell.border = border
 
-def create_excel(df_client, df_gis, recon, only_client, only_gis, mismatch):
-    wb = Workbook()
-
-    # -- Reconciliation Table (main)
-    ws = wb.active
-    ws.title = "Reconciliation Table"
-
-    main_headers = [
-        "Entity",
-        "Org Chart Parent",
-        "GIS Parent (Exact)",
-        "Exact Status",
-        "Fuzzy Best Match (GIS)",
-        "Fuzzy Best Match Parent (GIS)",
-        "Fuzzy Score",
-        "Final Parent Comparison"
-    ]
-    ws.append(main_headers)
-    for _, r in recon.iterrows():
-        ws.append([
-            r.get("Entity", ""),
-            r.get("Org Chart Parent", ""),
-            r.get("GIS Parent (Exact)", r.get("GIS Parent", "")),
-            r.get("Exact Status", ""),
-            r.get("Fuzzy Best Match (GIS)", ""),
-            r.get("Fuzzy Best Match Parent (GIS)", ""),
-            r.get("Fuzzy Score", ""),
-            r.get("Final Parent Comparison", "")
-        ])
-    apply_style(ws)
-
-    # -- Only in Client Org
-    ws = wb.create_sheet("Only in Client Org")
-    ws.append(["Entity", "Org Chart Parent"])
-    for _, r in only_client.iterrows():
-        ws.append([
-            r.get("Entity", ""),
-            r.get("Org Chart Parent", "")
-        ])
-    apply_style(ws)
-
-    # -- Only in GIS
-    ws = wb.create_sheet("Only in GIS")
-    ws.append([
-        "Entity",
-        "GIS Parent (Exact)",
-        "Fuzzy Best Match (GIS)",
-        "Fuzzy Best Match Parent (GIS)",
-        "Fuzzy Score"
-    ])
-    for _, r in only_gis.iterrows():
-        ws.append([
-            r.get("Entity", ""),
-            r.get("GIS Parent (Exact)", r.get("GIS Parent", "")),
-            r.get("Fuzzy Best Match (GIS)", ""),
-            r.get("Fuzzy Best Match Parent (GIS)", ""),
-            r.get("Fuzzy Score", ""),
-        ])
-    apply_style(ws)
-
-    # -- Parent Mismatch
-    ws = wb.create_sheet("Parent Mismatch")
-    ws.append([
-        "Entity",
-        "Client Parent",
-        "GIS Parent (Exact)",
-        "Fuzzy Best Match (GIS)",
-        "Fuzzy Best Match Parent (GIS)",
-        "Fuzzy Score",
-        "Final Parent Comparison"
-    ])
-    for _, r in mismatch.iterrows():
-        ws.append([
-            r.get("Entity", ""),
-            r.get("Org Chart Parent", ""),
-            r.get("GIS Parent (Exact)", r.get("GIS Parent", "")),
-            r.get("Fuzzy Best Match (GIS)", ""),
-            r.get("Fuzzy Best Match Parent (GIS)", ""),
-            r.get("Fuzzy Score", ""),
-            r.get("Final Parent Comparison", "")
-        ])
-    apply_style(ws)
-
-    # -- Full Extracted Client Tree
-    ws = wb.create_sheet("Full Extracted Client Tree")
-    ws.append(["Entity", "Parent"])
-    for _, r in df_client.iterrows():
-        # df_client columns are 'entity' and 'parent' (lowercase)
-        ws.append([r.get("entity", ""), r.get("parent", "")])
-    apply_style(ws)
-
-    # Save and return path
     path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
     wb.save(path)
     return path
 
-# ---------------------------
+# -----------------------
 # UI
-# ---------------------------
-st.title("📊 EY GIS Reconciler — Final Version")
+# -----------------------
+st.title("EY GIS Reconciler — Entity & Parent Name Matching (Option B)")
+st.markdown("**Note:** This tool uses only `Entity Name` and `Parent Name` from the GIS extract and the client org chart.")
 
-with st.expander("Required New Process"):
-    st.markdown("""
-- Audit team uploads the latest client organisation chart into the tool  
-- GIS reconciler tool will scan the file uploaded by user and compares with the GIS data  
-- If the GIS recon tool cannot fetch GIS data automatically, user uploads GIS extract  
-- The tool gives a detailed report highlighting differences  
-- Risk team updates GIS after validation  
-""")
+st.subheader("1) Upload inputs")
+st.write("- GIS extract MUST contain columns: `Entity Name` and `Parent Name`.")
+st.write("- Client extraction may be a JSON/CSV with `entity`/`parent` or you can upload PDF if Azure vision is configured.")
 
-client_file = st.file_uploader("Upload Client Org Chart (PDF/JPG/PNG)", type=["pdf","jpg","jpeg","png"])
-gis_file = st.file_uploader("Upload GIS Extract (Excel/CSV)", type=["xlsx","csv"])
+client_file = st.file_uploader("Client Org Chart (PDF / JSON / CSV)", type=["pdf","json","csv"])
+gis_file = st.file_uploader("GIS Extract (Excel/CSV) — must contain 'Entity Name' & 'Parent Name'", type=["xlsx","csv"])
 
-if not client_file or not gis_file:
+if not gis_file:
     st.stop()
 
-# GIS load
-if gis_file.name.endswith(".xlsx"):
-    df_gis_raw = pd.read_excel(gis_file)
+# Load GIS using explicit column names "Entity Name" and "Parent Name"
+try:
+    if gis_file.name.lower().endswith(".xlsx"):
+        raw_gis = pd.read_excel(gis_file)
+    else:
+        raw_gis = pd.read_csv(gis_file)
+except Exception as e:
+    st.error(f"Failed to read GIS file: {e}")
+    st.stop()
+
+# Normalize and map to entity,parent (explicitly reading 'Entity Name' and 'Parent Name')
+df_gis = normalize_entity_parent_from_generic(raw_gis)
+
+# Load client (either via PDF extraction or JSON/CSV)
+df_client = None
+if client_file:
+    if client_file.name.lower().endswith(".pdf"):
+        if client is None:
+            st.warning("Azure OpenAI not configured. Upload pre-extracted JSON/CSV for client instead of PDF.")
+        else:
+            # extract using fitted approach - conservative (may require valid Azure/OpenAI)
+            import fitz
+            images = []
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(client_file.read())
+                tmp_path = tmp.name
+            pdf = fitz.open(tmp_path)
+            pages = []
+            for i, page in enumerate(pdf, start=1):
+                pix = page.get_pixmap(dpi=300)
+                img_bytes = pix.tobytes("png")
+                # call Azure OpenAI Vision (Responses) similar to prior examples
+                try:
+                    img_b64 = base64.b64encode(img_bytes).decode()
+                    resp = client.responses.create(
+                        model=AZURE_DEPLOY,
+                        input=[{
+                            "role":"user",
+                            "content":[
+                                {"type":"input_text","text":(
+                                    "Extract ALL entities and parent-child relationships from this org chart. "
+                                    "Return STRICT JSON array like: [{\"entity\":\"<name>\",\"parent\":\"<parent name>\"}, ...]."
+                                )},
+                                {"type":"input_image","image_url":f"data:image/png;base64,{img_b64}"}
+                            ]
+                        }],
+                        max_output_tokens=1500
+                    )
+                    text_acc = []
+                    if resp.output:
+                        for msg in resp.output:
+                            for c in msg.content:
+                                if hasattr(c, "text") and c.text:
+                                    text_acc.append(c.text)
+                    raw_text = "\n".join(text_acc)
+                    # parse robustly
+                    cleaned = raw_text.strip().replace("```json","").replace("```","").strip()
+                    try:
+                        parsed = pd.DataFrame(json.loads(cleaned))
+                    except Exception:
+                        try:
+                            parsed = pd.DataFrame(eval(cleaned.replace(": null", ": None")))
+                        except Exception:
+                            parsed = None
+                    if parsed is not None:
+                        parsed = normalize_entity_parent_from_generic(parsed)
+                        pages.append(parsed)
+                except Exception as e:
+                    st.error(f"Vision error on page {i}: {e}")
+            if pages:
+                df_client = pd.concat(pages, ignore_index=True)
+    else:
+        # JSON/CSV
+        try:
+            if client_file.name.lower().endswith(".json"):
+                obj = json.load(client_file)
+                df_client = pd.DataFrame(obj)
+            else:
+                df_client = pd.read_csv(client_file)
+        except Exception as e:
+            st.error(f"Failed to read client file: {e}")
+            df_client = None
+
+if df_client is None:
+    st.info("No client extraction loaded (or extraction failed). Proceeding with empty client tree.")
+    df_client = pd.DataFrame(columns=["entity","parent"])
+
+df_client = normalize_entity_parent_from_generic(df_client)
+
+# Persist session state for approvals
+if "df_client" not in st.session_state:
+    st.session_state.df_client = df_client.copy()
+if "df_gis" not in st.session_state:
+    st.session_state.df_gis = df_gis.copy()
+
+# Compute reconciliation
+recon = compute_reconciliation(st.session_state.df_client, st.session_state.df_gis, fuzzy_threshold=FUZZY_THRESHOLD)
+
+st.subheader("2) Reconciliation table (Entity & Parent name focus)")
+cols_to_show = ["Entity Name in GIS","Entity Name in Org Chart","Parent Name in GIS","Parent Name in Org Chart","Fuzzy Best Match (GIS)","Fuzzy Best Match Parent (GIS)","Fuzzy Score","Action point"]
+st.dataframe(recon[cols_to_show], height=450)
+
+# Human approval: accept fuzzy candidate (score >= threshold & missing in client)
+st.subheader("3) Human approve fuzzy suggestion")
+candidates = recon[(recon["Fuzzy Score"] >= FUZZY_THRESHOLD) & (recon["Entity Name in Org Chart"].str.strip() == "")]
+if not candidates.empty:
+    cand_display = candidates.apply(lambda r: f"{r['Fuzzy Best Match (GIS)']} (score: {r['Fuzzy Score']}) — parent: {r['Fuzzy Best Match Parent (GIS)']}", axis=1).tolist()
+    sel = st.selectbox("Choose fuzzy candidate to accept", options=cand_display)
+    if st.button("Accept fuzzy match and add to Client org chart"):
+        idx = cand_display.index(sel)
+        row = candidates.iloc[idx]
+        new_row = {"entity": row["Fuzzy Best Match (GIS)"], "parent": row["Fuzzy Best Match Parent (GIS)"]}
+        st.session_state.df_client = pd.concat([st.session_state.df_client, pd.DataFrame([new_row])], ignore_index=True)
+        st.success(f"Accepted fuzzy match '{new_row['entity']}' — added to Client org chart (in-session).")
+        st.experimental_rerun()
 else:
-    df_gis_raw = pd.read_csv(gis_file)
-
-df_gis = normalize_entity_parent(df_gis_raw)
-
-# Extract hierarchy
-st.subheader("Extracting from org chart...")
-images = pdf_to_images(client_file) if client_file.name.endswith(".pdf") else [client_file.read()]
-pages = []
-
-for i, img in enumerate(images, start=1):
-    st.write(f"Page {i}")
-    raw = call_gpt4o_extract(img)
-    if not raw:
-        continue
-    st.code(raw[:2500])
-    df = parse_model_json(raw)
-    if df is not None:
-        df = normalize_entity_parent(df)
-        pages.append(df)
-
-if not pages:
-    st.error("No hierarchy extracted.")
-    st.stop()
-
-df_client = pd.concat(pages, ignore_index=True)
-
-# Reconciliation
-st.subheader("Building reconciliation...")
-recon, only_client, only_gis, mismatch = build_reconciliation(df_client, df_gis)
-
-st.dataframe(recon)
-
-# Debug output for assurance
-st.write("RECON COLUMNS:", recon.columns.tolist())
-st.write("ONLY_GIS COLUMNS:", only_gis.columns.tolist())
+    st.info("No fuzzy candidates meeting threshold AND missing in Client.")
 
 # Export
-excel = create_excel(df_client, df_gis, recon, only_client, only_gis, mismatch)
+st.subheader("4) Export styled reconciliation")
+excel_path = export_styled_excel(recon)
+with open(excel_path, "rb") as f:
+    st.download_button("Download reconciliation (styled Excel)", f, file_name="reconciliation.xlsx")
 
-with open(excel, "rb") as f:
-    st.download_button("Download GIS_Reconciliation.xlsx", f, "GIS_Reconciliation.xlsx")
+# Optional: export updated client CSV after approvals
+st.subheader("5) Export updated client (after approvals)")
+csv_path = None
+if not st.session_state.df_client.empty:
+    csv_path = tempfile.NamedTemporaryFile(delete=False, suffix=".csv").name
+    st.session_state.df_client.to_csv(csv_path, index=False)
+    with open(csv_path, "rb") as f:
+        st.download_button("Download updated client CSV", f, file_name="client_updated.csv")
 
-st.success("Done.")
-
-
+st.write("Done. Matching relies ONLY on Entity Name and Parent Name from GIS and Org Chart extraction.")
